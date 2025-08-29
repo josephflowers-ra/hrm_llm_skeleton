@@ -164,6 +164,69 @@ python3 train.py \
 
 ---
 
+
+---
+            ┌──────────────────────────┐
+            │        Input Text        │
+            └─────────────┬────────────┘
+                          │
+                          ▼
+            ┌──────────────────────────┐
+            │   Frozen LLM Encoder     │
+            │  (last hidden states h)  │
+            └─────────────┬────────────┘
+                          │
+         Pool prompt tokens (mean over Lp)
+                          │
+                          ▼
+            ┌──────────────────────────┐
+            │  Projection to HRM dim   │
+            │       (x̃ ∈ R^512)       │
+            └─────────────┬────────────┘
+                          │
+          ┌───────────────┴────────────────┐
+          │          HRM Loop              │
+          │                                │
+          │   For each segment m=1..M:     │
+          │    ┌──────────────────────┐    │
+          │    │  L-block (fast)      │◄───┐
+          │    │  T inner steps       │    │
+          │    └─────────┬────────────┘    │
+          │              │                  │
+          │    ┌─────────▼────────────┐     │
+          │    │  H-block (slow)      │     │
+          │    │  1 step per segment  │     │
+          │    └─────────┬────────────┘     │
+          │              │ z_H^m            │
+          └──────────────┼──────────────────┘
+                         │
+                         ▼
+          ┌──────────────────────────┐
+          │    Injector Module       │
+          │  (GRB or Cross-Attn CAB) │
+          └─────────────┬────────────┘
+                        │
+         Inject z_H into final LLM hidden states
+                        │
+                        ▼
+            ┌──────────────────────────┐
+            │    LLM LM Head           │
+            │  (token prediction)      │
+            └─────────────┬────────────┘
+                          │
+                          ▼
+            ┌──────────────────────────┐
+            │   Output Text / Tokens   │
+            └──────────────────────────┘
+
+Training: Cross-Entropy loss (+ ACT/Q-loss if enabled)  
+Segments supervised with detach between cycles (O(1) memory)
+
+
+
+---
+
+
 ## Limitations & Next Steps
 
 ⚠️ **Stablemax:** Currently approximated by logit temperature scaling; a true stablemax head could be added.
