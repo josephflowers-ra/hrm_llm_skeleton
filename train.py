@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Minimal trainer for the HRM + LLM hybrid.
+Minimal trainer for the HRM + LLM hybrid, with spot-check logging.
 
 Adds:
 - --injector {grb,cab} to choose GRB vs CAB
-- --save_dir / --save_every / --resume for lightweight checkpoints
+- --save_dir / --save_every / --resume (saves optimizer state too)
 - --eval_batches to control quick proxy eval loop
-- Clear comments for each step of the pipeline
+- --log_samples_every to print example prompt/target/pred triples
+- --max_new_tokens to cap decoded length in spot-checks
 """
 
 import argparse, os, random, time, torch
@@ -70,6 +71,59 @@ def evaluate(model: HRMController, dl, device: str, max_batches: int = 10):
 
 
 # ---------------------------
+# Utility: pretty print a few samples (prompt/target/pred) + zH norm
+# ---------------------------
+def spot_check_samples(model: HRMController, dl_eval, device: str, max_new_tokens: int, n_print: int = 3):
+    model.eval()
+    with torch.no_grad():
+        try:
+            batch = next(iter(dl_eval))
+        except StopIteration:
+            return
+        col = model.collate(batch)
+        for k in ("input_ids", "attention_mask", "labels"):
+            col[k] = col[k].to(device)
+
+        last_hidden = model.forward_llm_hidden(col["input_ids"], col["attention_mask"])
+        x_pool = model.pool_tokens(last_hidden, col["attention_mask"], col["prompt_lengths"])
+        x_tilde = model.x_proj(x_pool)
+        zH = model.hrm_segments(
+            x_tilde, segments=model.hrm_cfg.segments, inner_T=model.hrm_cfg.inner_T
+        )[-1]
+        inj = model.injector(last_hidden, zH)
+        logits = model.logits_from_injected(inj)
+        pred_ids = logits.argmax(-1)
+
+        # Debug latent magnitude
+        z_norm = torch.norm(zH, dim=-1).mean().item()
+        print(f"\n[SPOT CHECK] mean ||z_H|| = {z_norm:.3f}")
+
+        # Print a few examples
+        print("[SPOT CHECK] Showing up to", n_print, "examples:")
+        for i, item in enumerate(batch[:n_print]):
+            Lp = col["prompt_lengths"][i]
+            prompt_ids = col["input_ids"][i, :Lp]
+            target_ids = col["labels"][i, Lp:]
+            # Replace ignore_index (-100) with pad for readable decode
+            target_ids = target_ids.masked_fill(target_ids == model.hrm_cfg.vocab_ignore_index,
+                                               model.tokenizer.pad_token_id or 0)
+
+            # Cap decode lengths for readability
+            prompt_txt = model.tokenizer.decode(prompt_ids[:max_new_tokens],
+                                                skip_special_tokens=True)
+            target_txt = model.tokenizer.decode(target_ids[:max_new_tokens],
+                                                skip_special_tokens=True)
+            pred_txt   = model.tokenizer.decode(pred_ids[i, Lp: Lp + max_new_tokens],
+                                                skip_special_tokens=True)
+
+            print(f"\n-- Example {i+1} --")
+            print("Prompt:", prompt_txt.strip())
+            print("Target:", target_txt.strip())
+            print("Pred:  ", pred_txt.strip())
+    model.train()
+
+
+# ---------------------------
 # Main
 # ---------------------------
 def main():
@@ -101,8 +155,14 @@ def main():
 
     # I/O
     ap.add_argument("--save_dir", type=str, default="checkpoints")
-    ap.add_argument("--save_every", type=int, default=200, help="Save every N steps.")
+    ap.add_argument("--save_every", type=int, default=1000, help="Save every N steps (e.g., 500 or 1000).")
     ap.add_argument("--resume", type=str, default="", help="Path to .pt checkpoint to resume.")
+
+    # Spot-check logs
+    ap.add_argument("--log_samples_every", type=int, default=500,
+                    help="Steps between printing example prompt/target/pred triples.")
+    ap.add_argument("--max_new_tokens", type=int, default=64,
+                    help="Max tokens to decode for targets/preds in spot-checks.")
 
     # System
     ap.add_argument("--seed", type=int, default=1337)
@@ -129,10 +189,18 @@ def main():
 
     # Resume (optional)
     os.makedirs(args.save_dir, exist_ok=True)
+    optim = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1
+    )
     if args.resume:
         ckpt = torch.load(args.resume, map_location=args.device)
         model.load_trainable_state_dict(ckpt["state"])
+        if "optim" in ckpt:
+            optim.load_state_dict(ckpt["optim"])
         print(f"[INFO] Resumed from {args.resume} (step={ckpt.get('step')})")
+
+    print(f"[INFO] Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     # Data
     ds_train = build_reasoning_dataset(args.task, "train", n=2000)
@@ -141,13 +209,6 @@ def main():
                           drop_last=True,  collate_fn=lambda b: b)
     dl_eval  = DataLoader(ds_eval,  batch_size=args.batch_size, shuffle=False,
                           drop_last=False, collate_fn=lambda b: b)
-
-    # Optimizer
-    optim = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1
-    )
-    print(f"[INFO] Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     # Train
     step = 0
@@ -185,10 +246,16 @@ def main():
                 dt = time.time() - t0
                 print(f"[EVAL {step}] acc_proxy={ev['eval_acc_proxy']:.3f} on n={ev['n']} | elapsed={dt/60:.1f}m")
 
-            # Save lightweight checkpoints
+            # Spot-check a few samples (prompt/target/pred) and z_H norm
+            if step % args.log_samples_every == 0:
+                spot_check_samples(model, dl_eval, args.device, args.max_new_tokens, n_print=3)
+
+            # Save lightweight checkpoints (model + optimizer)
             if (step % args.save_every == 0) or (step >= args.max_steps):
                 path = os.path.join(args.save_dir, f"hrm_step{step}.pt")
-                torch.save({"step": step, "state": model.trainable_state_dict()}, path)
+                torch.save({"step": step,
+                            "state": model.trainable_state_dict(),
+                            "optim": optim.state_dict()}, path)
                 print(f"[CKPT] Saved {path}")
 
             if step >= args.max_steps:
