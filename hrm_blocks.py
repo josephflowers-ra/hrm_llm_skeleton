@@ -14,15 +14,29 @@ class SwiGLU(nn.Module):
     def forward(self,x): import torch.nn.functional as F; return self.w3(F.silu(self.w1(x))*self.w2(x))
 
 class SelfAttention(nn.Module):
-    def __init__(self,d,h): super().__init__(); assert d%h==0; self.d=d; self.h=h; self.hd=d//h
-    def forward(self,x,mask=None):
-        qkv=nn.Linear(self.d,3*self.d,bias=False).to(x.device)(x)
-        q,k,v=qkv.split(self.d,-1)
-        q=rearrange(q,'b t (h d)->b h t d',h=self.h); k=rearrange(k,'b t (h d)->b h t d',h=self.h); v=rearrange(v,'b t (h d)->b h t d',h=self.h)
-        att=(q@k.transpose(-1,-2))/(self.hd**0.5); 
-        if mask is not None: att=att.masked_fill(mask==0,float('-inf'))
-        att=torch.softmax(att,-1); y=att@v; y=rearrange(y,'b h t d->b t (h d)')
-        return nn.Linear(self.d,self.d,bias=False).to(x.device)(y)
+    def __init__(self, d, h):
+        super().__init__()
+        assert d % h == 0
+        self.d = d; self.h = h; self.hd = d // h
+        # register once
+        self.w_qkv = nn.Linear(d, 3 * d, bias=False)
+        self.w_o = nn.Linear(d, d, bias=False)
+
+    def forward(self, x, mask=None):
+        qkv = self.w_qkv(x)
+        q, k, v = qkv.split(self.d, dim=-1)
+        q = rearrange(q, 'b t (h d) -> b h t d', h=self.h)
+        k = rearrange(k, 'b t (h d) -> b h t d', h=self.h)
+        v = rearrange(v, 'b t (h d) -> b h t d', h=self.h)
+        att = (q @ k.transpose(-1, -2)) / (self.hd ** 0.5)  # (B, h, T, T)
+        if mask is not None:
+            # expect mask (B, T) 1/0; broadcast to (B, 1, 1, T) over keys
+            att = att.masked_fill(mask[:, None, None, :] == 0, float('-inf'))
+        att = torch.softmax(att, dim=-1)  # softmax over KEYS
+        y = att @ v                                   # (B, h, T, d)
+        y = rearrange(y, 'b h t d -> b t (h d)')
+        return self.w_o(y)
+
 
 class TransformerBlock(nn.Module):
     def __init__(self,d,h,mlp_expansion=4):
