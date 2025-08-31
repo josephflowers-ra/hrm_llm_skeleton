@@ -353,6 +353,3 @@ Planned:
 * Lucidrains HRM (PyTorch): [https://github.com/lucidrains/HRM](https://github.com/lucidrains/HRM)
 
 ---
-
-If you want, I can also make a PR-ready `README.md` with the CLI flags actually present in your current `train.py` (or include diffs to add them).
-
