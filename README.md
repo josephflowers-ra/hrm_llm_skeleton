@@ -1,8 +1,69 @@
 
 ---
 
+# HRM-LLM Hybrid
+
+## Overview
+
+This repository implements a **Hierarchical Reasoning Model (HRM)** controller on top of a **frozen language model (LLM)**. The LLM provides fluent text generation, while HRM contributes structured latent reasoning in hidden space.
+
+Unlike standard Chain-of-Thought prompting (which externalizes reasoning into text), HRM enables the system to **“think silently” in hidden states** before producing an answer. This yields deeper, more reliable reasoning without long token chains.
+
+Key ingredients:
+
+* **Frozen Hugging Face LLM** (TinyLlama, Qwen, etc.)
+* **Hierarchical Reasoning Model (HRM)**: coupled high-level (H) and low-level (L) recurrent modules.
+* **Injectors** (GRB or CAB) to bias LLM hidden states with HRM’s latent reasoning output.
+* **Optional ACT halting** (q-head) to adapt reasoning depth per query.
+* **Reasoning-Gym datasets** for arithmetic, equations, and symbolic tasks.
+* **Minimal training harness** with deep supervision, spot-check logging, and inference-time scaling.
+
+---
+
+## Quick Results
+
+Our first stable training run (≈ **50,000 steps**) with a frozen **TinyLlama** backbone + **HRM controller** reached:
+
+* **Proxy Eval Accuracy:** \~**95%** (n=200, greedy decode)
+* **Tasks:** arithmetic (addition, subtraction, equations, GSM symbolic mix)
+* **z\_H mean norm:** \~13
+* **Training Loss:** fell to near-zero on supervised segments
+* **Spot-check outputs:** exact numeric answers, EOS termination
 
 
+### Current HRMConfig
+
+```python
+class HRMConfig:
+    # Latent width / depth
+    d_h: int = 512
+    h_layers: int = 4
+    l_layers: int = 4
+    n_heads: int = 8
+
+    # Unrolled dynamics
+    inner_T: int = 3
+    segments: int = 3
+
+    # Bridges / options
+    use_cab: bool = False     # False → GRB, True → CAB
+    use_act: bool = False
+
+    # Small vocab-bias head (z_H → logits bias), gated
+    logit_bias_head: bool = True
+    logit_bias_init: float = -2.0  # sigmoid(-2) ≈ 0.12 initial strength
+
+    # Label masking for CE
+    vocab_ignore_index: int = -100
+```
+
+### Approximate Model Size
+
+* **Base LLM (frozen):** TinyLlama-1.1B (\~1.1B params)
+* **HRM controller + injectors + bias head:** \~**25–30M params** (depending on hidden size and CAB mem tokens)
+* **Total trainable parameters:** \~**30M** (≈ 3% of backbone)
+
+---
 
 ---
             ┌──────────────────────────────────────────────────────────┐
@@ -88,100 +149,126 @@
 
 
 
----
-
-
-Love it—here’s an updated `README.md` that matches your current code and training setup (multi-token CAB, vocab-bias head, EOS handling, eval wiring, etc.). It also adds quickstarts, new CLI flags, troubleshooting, and checkpoint notes.
 
 ---
 
-# HRM-LLM Hybrid (Frozen LLM + HRM Controller)
+## Motivation
 
-## Overview
+Current LLMs excel at language but struggle with robust, multi-step reasoning. Chain-of-Thought (CoT) prompting helps, but it is:
 
-This repo augments small, open-weight language models (TinyLlama, Qwen2.5, etc.) with a **Hierarchical Reasoning Model (HRM)** controller. The LLM stays **frozen** (no finetuning). A lightweight HRM runs **latent reasoning** on pooled prompt features and then **steers** the LLM’s output via:
+* **Brittle**: a single token error can derail the whole chain.
+* **Data-hungry**: requires many demonstrations.
+* **Slow**: long token chains inflate latency and cost.
 
-* a **Cross-Attention Bridge (CAB)** with **multi-token memory** derived from the HRM state, and
-* a tiny, gated **vocab-bias head** that adds a learned bias over the vocabulary at decode time.
+HRM provides **latent recurrence** in hidden space instead of tokens:
 
-This hybrid lets the LLM remain the **fluent communicator**, while HRM performs **silent computation** in hidden space.
+* **Two timescales** of reasoning:
 
-What you get:
-
-* HRM H/L blocks (fast/slow recurrence, hierarchical convergence).
-* Injectors: **GRB** (gated residual bias) and **CAB** (multi-token cross-attn).
-* Deep supervision with **O(1)** memory (detach between segments; one-step grads).
-* Optional **ACT** halting head.
-* Reasoning-Gym adapter + minimal training harness.
-
----
-
-## Background: HRM in a Nutshell
-
-HRM runs two timescales of recurrence:
-
-* **L-module (fast)** takes several micro-steps per segment to find a local fixed point.
-* **H-module (slow)** updates once per segment to guide L.
-
-Training uses a one-step approximation (no BPTT through time), applies loss each segment, and **detaches** between segments—keeping memory usage constant.
-
-Why this matters:
-
-* **Compact latent reasoning** (no long token chains).
-* **Inference scaling**: increase segments at eval to deepen reasoning without retraining.
-* **Data-efficient**: useful on structured math/logical tasks.
+  * **L-module** (fast, detailed, multiple micro-steps per cycle).
+  * **H-module** (slow, abstract, 1 step per cycle).
+* **Hierarchical convergence**: the L-module converges locally, then resets under updated guidance from the H-module.
+* **O(1) memory training** via one-step gradient + deep supervision.
+* **ACT halting**: decide dynamically how many reasoning cycles to run.
+* **Inference-time scaling**: increase segments at inference to “think longer” without retraining.
 
 ---
 
-## What’s New vs. the Old Skeleton
+## Architecture Overview
 
-**Controller & decoding**
+The pipeline combines a frozen LLM with HRM reasoning and injects the results back into the LLM hidden space before decoding.
 
-* Mixed prompt pooling (**mean + last**) → projection to HRM width.
-* **Final norm** is applied (when the base model expects it) before the LM head.
-* **EOS is appended** to each target to teach “answer → stop”.
-
-**Stronger steering**
-
-* **CAB** now supports **multi-token memory** (`mem_tokens`), not just a single token.
-* **Vocab-bias head**: a tiny linear from HRM state (`z_H`) into the vocab logits, behind a sigmoid gate.
-* Both are **gated** (sigmoid) so you can tune their strength.
-
-**Eval wiring**
-
-* During eval/spot-checks, logits are produced with
-  `model.logits_from_injected(..., zH=zH)` so the **vocab-bias head** is active (this was crucial).
+👉 *(Insert the ASCII diagram we built together here — showing Input → Frozen LLM → Pool → HRM Loop → Injector → Norm → LM Head → Output, with ACT/q-head and vocab bias.)*
 
 ---
 
-## Repository Layout
+### Components
 
-* **`hrm_blocks.py`** – RMSNorm, SwiGLU MLP, SelfAttention, TransformerBlock, `HBlock` / `LBlock`.
-* **`injector.py`** –
+#### 1. Frozen LLM
 
-  * `InjectorGRB`: gated residual bias (z\_H → hidden bias).
-  * `CrossAttentionBridge`: **multi-token** z\_H memory with cross-attention (default `mem_tokens=4`), gated residual.
-* **`model.py`** – Frozen HF CausalLM + HRM controller: pooling, recurrence, injection, vocab-bias head, collator, trainable state helpers.
-* **`reasoning_gym_wrapper.py`** – Adapter that builds datasets & verifiers for tasks like `basic_arithmetic`, `gsm_symbolic`, `chain_sum`, `simple_equations`, etc.
-* **`train.py`** – Minimal trainer with eval/spot-checks, CSV logging, checkpoints, CLI flags.
+* Provides embeddings, hidden states, and LM head.
+* Parameters frozen (no fine-tuning required).
+* Final normalization layer optionally applied before logits.
+
+#### 2. Pooling & Projection
+
+* Mean+last pooling over **prompt tokens only**.
+* Linear projection to HRM dimension (`d_h`, default 512).
+
+#### 3. HRM Core
+
+* **L-block**: runs multiple fast inner steps per segment.
+* **H-block**: runs once per segment, steering the L-block across cycles.
+* **Hierarchical convergence**: keeps computation active across segments.
+* **RMSNorm** applied to z\_H.
+* **Deep supervision**: loss applied at each segment, with hidden states detached in between.
+
+#### 4. Injectors
+
+* **GRB (Gated Residual Bias)**: projects z\_H as a bias vector, gated by a learnable sigmoid scalar.
+* **CAB (Cross-Attention Bridge)**: treats z\_H as one or more memory tokens; token hidden states attend to it. Multi-token CAB offers stronger conditioning.
+* Both support residual gating to prevent destabilization.
+
+#### 5. Optional Heads
+
+* **ACT / q-head**: predicts halt vs. continue from z\_H at each segment. Enables Adaptive Computation Time.
+* **Vocab bias head**: adds a gated bias over vocabulary logits from z\_H. Helpful for structured outputs like numbers.
+
+#### 6. Training Procedure
+
+* Cross-entropy loss on target tokens (prompt region masked).
+* Optional q-loss for ACT halting.
+* Segment-level deep supervision with detach → O(1) memory.
+* AdamW optimizer with weight decay.
+* Gradient clipping for stability.
 
 ---
 
-## Installation
+## Datasets
 
-```bash
-pip install -r requirements.txt
-# typical:
-# torch, transformers, accelerate, datasets, einops, reasoning-gym
-```
+* **Toy addition / chain sum**
+* **Basic arithmetic**
+* **Simple equations**
+* **GSM symbolic reasoning**
 
-You’ll also need a local or HF-hub base model path, e.g. `TinyLlama/TinyLlama-1.1B-Chat-v1.0` or your local `./tiny-rl-sft`.
+Wrapped with a collator that:
+
+* Tokenizes prompt and target separately.
+* Concatenates them with masking (`ignore_index=-100` for prompt region).
+* Returns `input_ids`, `attention_mask`, `labels`, `prompt_lengths`, and raw examples (for verifiers).
 
 ---
 
-## Quickstart (your current winning setup)
+## Training Harness
 
-**Frozen LLM + HRM, CAB (multi-token), vocab-bias head, 2×2 train / 4-segment eval:**
+The provided `train.py` script supports:
+
+* **Arguments**:
+
+  * `--segments`, `--inner_T`: HRM loop depth.
+  * `--injector {grb,cab}`: choose injector.
+  * `--use_act`, `--act_penalty`: enable ACT/Q-head.
+  * `--decode_temperature`, `--decode_top_p`, `--decode_top_k`: sampling options at eval.
+  * `--eval_segments`: run deeper reasoning at eval-time.
+  * `--grad_clip`: stabilize updates.
+
+* **Logging**:
+
+  * Per-step losses.
+  * Per-segment losses and q-losses.
+  * Proxy eval accuracy with verifier functions.
+  * Spot-check decoded examples with greedy or sampling decode.
+  * CSV logging of eval curves.
+
+* **Checkpoints**:
+
+  * Lightweight save of trainable HRM parts + optimizer state.
+  * Resume training with `--resume path/to/checkpoint.pt`.
+
+---
+
+## Example Usage
+
+**Arithmetic reasoning (TinyLlama, CAB injector, 2×2 loop):**
 
 ```bash
 python3 train.py \
@@ -189,167 +276,48 @@ python3 train.py \
   --tasks basic_arithmetic,gsm_symbolic,chain_sum,simple_equations \
   --segments 2 --inner_T 2 \
   --injector cab \
-  --batch_size 2 --lr 3e-5 \
+  --batch_size 2 --lr 1e-5 \
   --max_steps 200000 \
   --save_every 10000 \
-  --eval_every 500 --eval_n 200 --eval_seed_jitter \
-  --log_samples_every 500 \
-  --max_new_tokens 512 \
-  --grad_clip 1.0 \
-  --eval_segments 4
+  --eval_every 500 --eval_n 200 --eval_segments 4 \
+  --log_samples_every 500 --max_new_tokens 512
 ```
 
-> Tip: For more steering, try `--eval_segments 6`.
-> If you added CLI wiring for gates/memory (see below), also try:
-> `--cab_mem 4 --cab_gate_init -1.0 --vocab_gate_init -1.0`.
-
 ---
 
-## What Trains (and What Stays Frozen)
+## Key Properties
 
-* **Frozen**: the base LLM (all transformer layers, LM head weights).
-
-  * We explicitly set `p.requires_grad_(False)` on the LLM and run `forward_llm_hidden` under `torch.no_grad()`.
-* **Trainable**:
-
-  * HRM: `HBlock`, `LBlock`, `RMSNorm`, learnable initial states `zH0`, `zL0`, and the projection layers (`pool_mix`, `x_proj`).
-  * Injector: **GRB** or **CAB** (now with multi-token memory).
-  * Optional **vocab-bias head** (and its gate).
-  * Optional **q\_head** if ACT is enabled.
-
----
-
-## CLI Flags of Interest
-
-Base (already in `train.py`):
-
-* `--segments`, `--inner_T` – HRM depth (train).
-* `--eval_segments` – HRM depth at eval (inference scaling).
-* `--injector {grb,cab}` – choose the bridge.
-* `--temperature` – CE logit temperature for training (e.g., `0.7` for sharper CE).
-* `--batch_size`, `--lr`, `--max_steps`, `--save_every`, `--eval_every`, `--eval_n`, `--grad_clip`…
-
-Recommended extras (add if not present yet):
-
-* `--cab_mem` (int, default 4): CAB memory tokens.
-* `--cab_gate_init` (float, default -1.5): initial CAB gate (sigmoid).
-* `--grb_gate_init` (float, default -2.0): initial GRB gate.
-* `--vocab_gate_init` (float, default -2.0): initial logit-bias gate.
-
-Wire these into `HRMConfig` and the injector/vocab-bias init so you can sweep from the CLI.
-
----
-
-## Results Snapshot (example)
-
-After wiring **multi-token CAB** and **vocab-bias head** (and ensuring eval calls `logits_from_injected(..., zH=zH)`), we’ve seen:
-
-```
-[EVAL 50000] acc_proxy ≈ 0.95 on n=200 (greedy decode)
-```
-
-Greedy decoding (T=1.0) on arithmetic and short word-math mixes returns clean, numeric final answers with EOS termination.
-
----
-
-## Training & Eval Flow
-
-1. **Frozen LLM forward** to get last hidden states for (prompt + target).
-2. **Pool prompt** only: mix of (mean + last), then project to HRM width.
-3. **HRM recurrence**: `segments × inner_T`, with detach between segments.
-4. **Inject** `z_H` into LLM final hidden states via **GRB** or **CAB**.
-5. **Final norm (if present)** → **LM head** → **logits**;
-   add **vocab-bias** from `z_H` when available.
-6. **Loss**: Cross-entropy over **target region** (prompt tokens masked with `-100`).
-7. **Eval/spot-check**: greedy decode over target region (and make sure the **vocab-bias** is active by passing `zH`).
-
----
-
-## Checkpoints & Compatibility
-
-* Changing from **1-token → multi-token CAB** or adding the **vocab-bias head** means **new tensors**.
-
-  * **Best**: start fresh.
-  * **Warm-start**: implement a **partial loader** that loads shared pieces and skips missing ones; re-init new parts; start with a fresh optimizer.
-* Old checkpoints from the single-token CAB won’t load into the multi-token CAB unless you skip shape-mismatched keys.
-
----
-
-## Troubleshooting
-
-* **Blank / EOS-only predictions at eval**
-  Ensure eval uses the vocab-bias head:
-
-  ```python
-  logits = model.logits_from_injected(model.injector(last_hidden, zH), zH=zH)
-  ```
-* **Steering feels too weak**
-  Increase HRM depth at eval (`--eval_segments 6`), bump CAB gate (e.g., `--cab_gate_init -1.0`), or increase `mem_tokens` to 4 or 8.
-* **Spiky loss early on**
-  Use `--grad_clip 1.0`, try LR in `3e-5 … 1e-4`, and `--temperature 0.7` (training CE only).
-* **Checkpoint fails to load**
-  Use the partial loader (skip missing keys) or start a new run.
-
----
-
-## Example Commands
-
-**Your current run (frozen LLM, CAB, 2×2 train / 4 eval):**
-
-```bash
-python3 train.py \
-  --model_name ./tiny-rl-sft \
-  --tasks basic_arithmetic,gsm_symbolic,chain_sum,simple_equations \
-  --segments 2 --inner_T 2 \
-  --injector cab \
-  --batch_size 2 --lr 3e-5 \
-  --max_steps 200000 \
-  --save_every 10000 \
-  --eval_every 500 --eval_n 200 --eval_seed_jitter \
-  --log_samples_every 500 \
-  --max_new_tokens 512 \
-  --grad_clip 1.0 \
-  --eval_segments 4
-```
-
-**Ablation: deeper eval, stronger gates**
-
-```bash
-python3 train.py \
-  --model_name ./tiny-rl-sft \
-  --tasks basic_arithmetic,gsm_symbolic,chain_sum,simple_equations \
-  --segments 2 --inner_T 2 \
-  --injector cab \
-  --cab_mem 8 --cab_gate_init -1.0 \
-  --vocab_gate_init -1.0 \
-  --batch_size 2 --lr 5e-5 --temperature 0.7 \
-  --max_steps 200000 --save_every 10000 \
-  --eval_every 500 --eval_n 200 \
-  --eval_segments 6 \
-  --log_samples_every 500 --max_new_tokens 512 \
-  --grad_clip 1.0
-```
+✅ **Latent reasoning**: computation happens in hidden space, not tokens.
+✅ **Constant memory**: deep supervision + one-step gradient avoid BPTT.
+✅ **Inference-time scaling**: simply raise `segments` at eval to think deeper.
+✅ **Optional ACT halting**: saves compute by stopping early.
+✅ **Flexible injectors**: GRB (lightweight) vs CAB (stronger conditioning).
+✅ **Frozen LLM**: no costly full-model fine-tuning.
 
 ---
 
 ## Limitations & Next Steps
 
-* **Frozen LLM**: great stability, but caps ceiling; consider optional small LoRA or partial unfreezing (e.g., final norm + lm\_head) once hybrid stabilizes.
-* **Task breadth**: extend beyond arithmetic to multi-step word problems, symbolic algebra, small logic tasks.
-* **Scheduling**: optional warmup / cosine decay can help; currently fixed LR is fine.
+⚠️ **Base LLM frozen**: limits synergy; adding LoRA to upper layers may help.
+⚠️ **Stablemax**: currently approximated with temperature scaling; future work could implement true stablemax.
+⚠️ **Task coverage**: focused on math/symbolic; needs broader datasets.
+⚠️ **ACT stability**: q-head halting works but can be finicky; reinforcement-style training could improve.
 
-Planned:
+**Planned extensions:**
 
-* CLI control for CAB memory and gates (if not already added).
-* “Best on eval” checkpointing & richer eval metrics (sign errors, numeric noise, per-length accuracy).
-* Optional static numeric bias on target positions as a safeguard (usually unnecessary now).
+* LoRA adapters for partial LLM tuning.
+* YAML/JSON configs for reproducible runs.
+* Integration with Cogito memory modules (episodic/graph memory).
+* Experiments with HRM-only (no LLM) baselines.
 
 ---
 
 ## References
 
-* *Hierarchical Reasoning Model* (Sapient Intelligence, 2025). arXiv:2506.21734
-* Sapient HRM GitHub: [https://github.com/sapientinc/HRM](https://github.com/sapientinc/HRM)
-* Lucidrains HRM (PyTorch): [https://github.com/lucidrains/HRM](https://github.com/lucidrains/HRM)
+* Sapient Intelligence. *Hierarchical Reasoning Model*. 2025. [arXiv:2506.21734](https://arxiv.org/abs/2506.21734)&#x20;
+* Sapient Intelligence HRM GitHub: [github.com/sapientinc/HRM](https://github.com/sapientinc/HRM)
+* Lucidrains experimental HRM repo: [github.com/lucidrains/HRM](https://github.com/lucidrains/HRM)
 
 ---
+
+
