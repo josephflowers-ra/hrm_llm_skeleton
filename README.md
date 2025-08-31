@@ -177,7 +177,6 @@ HRM provides **latent recurrence** in hidden space instead of tokens:
 
 The pipeline combines a frozen LLM with HRM reasoning and injects the results back into the LLM hidden space before decoding.
 
-👉 *(Insert the ASCII diagram we built together here — showing Input → Frozen LLM → Pool → HRM Loop → Injector → Norm → LM Head → Output, with ACT/q-head and vocab bias.)*
 
 ---
 
